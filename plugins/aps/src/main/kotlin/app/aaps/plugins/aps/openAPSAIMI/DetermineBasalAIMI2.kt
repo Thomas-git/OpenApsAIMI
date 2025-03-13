@@ -156,6 +156,125 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     //         value
     //     }
     // }
+// -- Classe représentant la décision de sécurité --
+    data class SafetyDecision(
+        val stopBasal: Boolean,      // true => arrête la basale (ou force une basale à 0)
+        val bolusFactor: Double,     // Facteur multiplicateur appliqué à la dose SMB (1.0 = dose complète, 0.0 = annulation)
+        val reason: String           // Log résumant les critères ayant conduit à la décision
+    )
+
+    // -- Calcul de la chute de BG par heure sur une fenêtre donnée (en minutes) --
+    fun calculateDropPerHour(bgHistory: List<Float>, windowMinutes: Float): Float {
+        if (bgHistory.isEmpty()) return 0f
+        val drop = bgHistory.last() - bgHistory.first()  // positif si baisse
+        return drop * (60f / windowMinutes)
+    }
+
+    // -- Fonction de sécurité qui combine plusieurs indicateurs pour ajuster la dose d'insuline --
+    fun safetyAdjustment(
+        currentBG: Float,
+        predictedBG: Float,
+        bgHistory: List<Float>,
+        combinedDelta: Float,
+        iob: Float,
+        maxIob: Float,
+        tdd24Hrs: Float,
+        tddPerHour: Float,
+        tirInhypo: Float,
+        targetBG: Float
+    ): SafetyDecision {
+        val windowMinutes = 30f
+        val dropPerHour = calculateDropPerHour(bgHistory, windowMinutes)
+        val maxAllowedDropPerHour = 25f  // Ajustez si besoin
+
+        val reasonBuilder = StringBuilder()
+        var stopBasal = false
+        var bolusFactor = 1.0
+
+        // 1. Contrôle de la chute
+        if (dropPerHour >= maxAllowedDropPerHour) {
+            // Option A : on arrête complètement la basale
+            stopBasal = true
+            // reasonBuilder.append("BG drop élevé: $dropPerHour mg/dL/h; ")
+
+            // Option B : on réduit fortement le bolusFactor sans stopper la basale
+            bolusFactor *= 0.3
+            reasonBuilder.append("BG drop élevé ($dropPerHour mg/dL/h), forte réduction du bolus; ")
+        }
+
+        // 2. Palier sur le combinedDelta
+        when {
+            combinedDelta < 1f -> {
+                bolusFactor *= 0.6
+                reasonBuilder.append("combinedDelta très faible ($combinedDelta), réduction x0.6; ")
+            }
+            combinedDelta < 2f -> {
+                bolusFactor *= 0.8
+                reasonBuilder.append("combinedDelta modéré ($combinedDelta), réduction x0.8; ")
+            }
+            else -> {
+                reasonBuilder.append("combinedDelta élevé ($combinedDelta), pas de réduction; ")
+            }
+        }
+
+        // 3. Plateau si BG élevé + combinedDelta très faible
+        if (currentBG > 160f && combinedDelta < 1f) {
+            bolusFactor *= 0.8
+            reasonBuilder.append("Plateau BG>180 & combinedDelta<2 => réduction x0.8; ")
+        }
+
+        // 4. Contrôle IOB
+        if (iob >= maxIob * 0.85f) {
+            bolusFactor *= 0.85
+            reasonBuilder.append("IOB élevé ($iob U), réduction x0.8; ")
+        }
+
+        // 5. Contrôle du TDD par heure
+        val tddThreshold = tdd24Hrs / 24f
+        if (tddPerHour > tddThreshold) {
+            bolusFactor *= 0.9
+            reasonBuilder.append("TDD/h élevé ($tddPerHour U/h), réduction x0.9; ")
+        }
+
+        // 6. TIR élevé
+        if (tirInhypo >= 8f) {
+            bolusFactor *= 0.6
+            reasonBuilder.append("TIR élevé ($tirInhypo%), réduction x0.7; ")
+        }
+
+        // 7. BG prédit proche de la cible
+        if (predictedBG < targetBG + 10) {
+            bolusFactor *= 0.5
+            reasonBuilder.append("BG prédit ($predictedBG) proche de la cible ($targetBG), réduction x0.5; ")
+        }
+
+        return SafetyDecision(
+            stopBasal = stopBasal,
+            bolusFactor = bolusFactor,
+            reason = reasonBuilder.toString()
+        )
+    }
+
+
+    // -- Méthode pour obtenir l'historique récent de BG, similaire à getRecentDeltas() --
+    private fun getRecentBGs(): List<Float> {
+        val data = iobCobCalculator.ads.getBucketedDataTableCopy() ?: return emptyList()
+        if (data.isEmpty()) return emptyList()
+
+        val nowTimestamp = data.first().timestamp
+        val recentBGs = mutableListOf<Float>()
+
+        for (i in 1 until data.size) {
+            if (data[i].value > 39 && !data[i].filledGap) {
+                val minutesAgo = ((nowTimestamp - data[i].timestamp) / (1000.0 * 60)).toFloat()
+                if (minutesAgo in 1.0f..30.0f) {
+                    // Utilisation de la valeur recalculée comme BG
+                    recentBGs.add(data[i].recalculated.toFloat())
+                }
+            }
+        }
+        return recentBGs
+    }
 
     // Rounds value to 'digits' decimal places
     // different for negative numbers fun round(value: Double, digits: Int): Double = BigDecimal(value).setScale(digits, RoundingMode.HALF_EVEN).toDouble()
@@ -416,7 +535,11 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     ): Boolean {
         // Récupération de la valeur de pbolusMeal depuis les préférences
         val pbolusM: Double = preferences.get(DoubleKey.OApsAIMIMealPrebolus)
-
+        // Récupération des deltas récents et calcul du delta prédit
+        val recentDeltas = getRecentDeltas()
+        val predicted = predictedDelta(recentDeltas)
+        // Calcul du delta combiné : combine le delta mesuré et le delta prédit
+        val combinedDelta = (delta + predicted) / 2.0f
         // Si un bolus de pbolusM a déjà été administré dans la dernière heure, on ne le ré-administrera pas
         if (hasReceivedPbolusMInLastHour(pbolusM)) {
             return false
@@ -424,8 +547,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
 
         return variableSensitivity in 5.0f..10f &&
             targetBg in 70.0f..85.0f &&
-            delta >= 12 &&
-            shortAvgDelta >= 12 &&
+            combinedDelta >= 4 &&
             autodrive &&
             slopeFromMinDeviation >= 1.5 &&
             bg > 120
@@ -502,9 +624,9 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         if (droppingVeryFast) conditionsTrue.add("droppingVeryFast")
         val prediction = eventualBG < targetBg && bg < 135 && !mealTime && !bfastTime && !highCarbTime && !lunchTime && !dinnerTime
         if (prediction) conditionsTrue.add("prediction")
-        val interval = eventualBG < targetBg && delta > 10 && iob >= maxSMB/2 && lastsmbtime < 10 && !mealTime && !bfastTime && !highCarbTime && !lunchTime && !dinnerTime
+        val interval = eventualBG < targetBg && delta > 10 && iob >= maxSMB/2 && lastsmbtime < 10 && !mealTime && !bfastTime && !highCarbTime && !lunchTime && !dinnerTime && !snackTime
         if (interval) conditionsTrue.add("interval")
-        val targetinterval = targetBg >= 120 && delta > 0 && iob >= maxSMB/2 && lastsmbtime < 12 && !mealTime && !bfastTime && !highCarbTime && !lunchTime && !dinnerTime
+        val targetinterval = targetBg >= 120 && delta > 0 && iob >= maxSMB/2 && lastsmbtime < 12 && !mealTime && !bfastTime && !highCarbTime && !lunchTime && !dinnerTime && !snackTime
         if (targetinterval) conditionsTrue.add("targetinterval")
         //val stablebg = delta>-3 && delta<3 && shortAvgDelta>-3 && shortAvgDelta<3 && longAvgDelta>-3 && longAvgDelta<3 && bg < 120 && !mealTime && !bfastTime && !highCarbTime && !lunchTime && !dinnerTime
         //if (stablebg) conditionsTrue.add("stablebg")
@@ -550,8 +672,8 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         val intervalHC = preferences.get(IntKey.OApsAIMIHCinterval)
         val intervalHighBG = preferences.get(IntKey.OApsAIMIHighBGinterval)
 
-        // Par défaut, on part d'un intervalle de base (par exemple 10 minutes)
-        var interval = 10
+        // Par défaut, on part d'un intervalle de base (par exemple 5 minutes)
+        var interval = 5
 
         // Si une des conditions d'intervalle est satisfaite, annuler l'intervalle (0 minute)
         if (shouldApplyIntervalAdjustment(
@@ -959,7 +1081,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         for (i in 1 until data.size) {
             if (data[i].value > 39 && !data[i].filledGap) {
                 val minutesAgo = ((nowTimestamp - data[i].timestamp) / (1000.0 * 60)).toFloat()
-                if (minutesAgo in 2.5f..7.5f) {
+                if (minutesAgo in 0.0f..10.0f) {
                     val delta = (data.first().recalculated - data[i].recalculated) / minutesAgo * 5f
                     recentDeltas.add(delta)
                 }
@@ -977,96 +1099,57 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         return weightedSum / weights.sum()
     }
 
-    // private fun adjustFactorsBasedOnBgAndHypo(
-    //     morningFactor: Float,
-    //     afternoonFactor: Float,
-    //     eveningFactor: Float
-    // ): Triple<Float, Float, Float> {
-    //     val honeymoon = preferences.get(BooleanKey.OApsAIMIhoneymoon)
-    //     val hypoAdjustment = if (bg < 120 || (iob > 3 * maxSMB)) 0.8f else 1.0f
-    //
-    //     // Interpolation pour factorAdjustment, avec une intensité plus forte au-dessus de 180
-    //     var factorAdjustment = when {
-    //         bg < 180 -> interpolateFactor(bg.toFloat(), 70f, 130f, 0.1f, 0.3f)  // Pour les valeurs entre 70 et 180 mg/dL
-    //         else -> interpolateFactor(bg.toFloat(), 130f, 250f, 0.4f, 0.8f)      // Intensité plus forte au-dessus de 180 mg/dL
-    //     }
-    //     if (honeymoon) factorAdjustment = when {
-    //         bg < 180 -> interpolateFactor(bg.toFloat(), 70f, 160f, 0.05f, 0.2f)
-    //         else -> interpolateFactor(bg.toFloat(), 160f, 250f, 0.2f, 0.3f)      // Valeurs plus basses pour la phase de honeymoon
-    //     }
-    //
-    //     // Vérification de delta pour éviter les NaN
-    //     val safeDelta = if (delta <= 0) 0.0001f else delta  // Empêche delta d'être 0 ou négatif
-    //
-    //     // Interpolation pour bgAdjustment
-    //     val deltaAdjustment = ln(safeDelta + 1).coerceAtLeast(0f) // S'assurer que ln(safeDelta + 1) est positif
-    //     val bgAdjustment = 1.0f + (deltaAdjustment - 1) * factorAdjustment
-    //
-    //     // Interpolation pour scalingFactor
-    //     val scalingFactor = interpolateFactor(bg.toFloat(), targetBg, 110f, 09f, 0.5f).coerceAtLeast(0.1f) // Empêche le scalingFactor d'être trop faible
-    //
-    //     val maxIncreaseFactor = 1.7f
-    //     val maxDecreaseFactor = 0.5f // Limite la diminution à 30% de la valeur d'origine
-    //
-    //     val adjustFactor = { factor: Float ->
-    //         val adjustedFactor = factor * bgAdjustment * hypoAdjustment * scalingFactor
-    //         adjustedFactor.coerceIn((factor * maxDecreaseFactor), (factor * maxIncreaseFactor))
-    //     }
-    //
-    //     // Retourne les valeurs en s'assurant qu'elles ne sont pas NaN
-    //     return Triple(
-    //         adjustFactor(morningFactor).takeIf { !it.isNaN() } ?: morningFactor,
-    //         adjustFactor(afternoonFactor).takeIf { !it.isNaN() } ?: afternoonFactor,
-    //         adjustFactor(eveningFactor).takeIf { !it.isNaN() } ?: eveningFactor
-    //     )
-    // }
     private fun adjustFactorsBasedOnBgAndHypo(
         morningFactor: Float,
         afternoonFactor: Float,
         eveningFactor: Float
     ): Triple<Float, Float, Float> {
         val honeymoon = preferences.get(BooleanKey.OApsAIMIhoneymoon)
-        val hypoAdjustment = if (bg < 120 || (iob > 3 * maxSMB)) 0.8f else 1.0f
-
-        // Interpolation de base pour factorAdjustment selon la glycémie (bg)
-        var factorAdjustment = when {
-            bg < 180 -> interpolateFactor(bg.toFloat(), 70f, 130f, 0.1f, 0.3f)
-            else -> interpolateFactor(bg.toFloat(), 130f, 250f, 0.4f, 0.8f)
-        }
-        if (honeymoon) factorAdjustment = when {
-            bg < 180 -> interpolateFactor(bg.toFloat(), 70f, 160f, 0.05f, 0.2f)
-            else -> interpolateFactor(bg.toFloat(), 160f, 250f, 0.2f, 0.3f)
-        }
-
+        val hypoAdjustment = if (bg < 120 || (iob > 3 * maxSMB)) 0.3f else 0.9f
         // Récupération des deltas récents et calcul du delta prédit
         val recentDeltas = getRecentDeltas()
         val predicted = predictedDelta(recentDeltas)
-        // Calcul du delta combiné : on combine le delta mesuré et le delta prédit
+        // Calcul du delta combiné : combine le delta mesuré et le delta prédit
         val combinedDelta = (delta + predicted) / 2.0f
-
-        // On s'assure que combinedDelta est positif pour le calcul logarithmique
+        // s'assurer que combinedDelta est positif pour le calcul logarithmique
         val safeCombinedDelta = if (combinedDelta <= 0) 0.0001f else combinedDelta
         val deltaAdjustment = ln(safeCombinedDelta.toDouble() + 1).coerceAtLeast(0.0)
-        var bgAdjustment = 1.0f + (deltaAdjustment - 1) * factorAdjustment
 
-        // Calcul d'un facteur dynamique basé sur le delta combiné
+
+        // Interpolation de base pour factorAdjustment selon la glycémie (bg)
+        var factorAdjustment = when {
+            bg < 120 -> interpolateFactor(bg.toFloat(), 70f, 120f, 0.1f, 0.3f)
+            else -> interpolateFactor(bg.toFloat(), 120f, 280f, 0.75f, 2.5f)
+        }
+        if (honeymoon) factorAdjustment = when {
+            bg < 160 -> interpolateFactor(bg.toFloat(), 70f, 160f, 0.2f, 0.4f)
+            else -> interpolateFactor(bg.toFloat(), 160f, 250f, 0.4f, 0.65f)
+        }
+        var bgAdjustment = 1.0f + (deltaAdjustment - 1) * factorAdjustment
+        bgAdjustment *= 1.2f
+
         val dynamicCorrection = when {
-            combinedDelta > 4f -> 0.8f   // Si la tendance monte rapidement, on réduit plus agressivement
-            combinedDelta < -3f -> 1.2f  // Si la tendance baisse, on augmente le facteur
+            combinedDelta > 11f  -> 2.5f   // Très forte montée, on augmente très agressivement
+            combinedDelta > 8f  -> 2.0f   // Montée forte
+            combinedDelta > 4f  -> 1.5f   // Montée modérée à forte
+            combinedDelta > 2f  -> 0.8f   // Montée légère
+            combinedDelta in -2f..2f -> 1.0f  // Stable
+            combinedDelta < -2f && combinedDelta >= -4f -> 0.8f  // Baisse légère
+            combinedDelta < -4f && combinedDelta >= -6f -> 0.6f  // Baisse modérée
+            combinedDelta < -6f -> 0.4f   // Baisse forte, on diminue considérablement pour éviter l'hypo
             else -> 1.0f
         }
-
         // On applique ce facteur sur bgAdjustment pour intégrer l'anticipation
         bgAdjustment *= dynamicCorrection
 
-        // Interpolation pour scalingFactor basée sur la cible (targetBg)
-        val scalingFactor = interpolateFactor(bg.toFloat(), targetBg, 110f, 09f, 0.5f).coerceAtLeast(0.1f)
+        // // Interpolation pour scalingFactor basée sur la cible (targetBg)
+        // val scalingFactor = interpolateFactor(bg.toFloat(), targetBg, 110f, 09f, 0.5f).coerceAtLeast(0.1f)
 
-        val maxIncreaseFactor = 1.7f
-        val maxDecreaseFactor = 0.5f
+        val maxIncreaseFactor = 12.5f
+        val maxDecreaseFactor = 0.2f
 
         val adjustFactor = { factor: Float ->
-            val adjustedFactor = factor * bgAdjustment * hypoAdjustment * scalingFactor
+            val adjustedFactor = factor * bgAdjustment * hypoAdjustment //* scalingFactor
             adjustedFactor.coerceIn(((factor * maxDecreaseFactor).toDouble()), ((factor * maxIncreaseFactor).toDouble()))
         }
 
@@ -1469,7 +1552,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
 
 
     private fun interpolatebasal(bg: Double): Double {
-        val clampedBG = bg.coerceIn(40.0, 300.0)
+        val clampedBG = bg.coerceIn(80.0, 300.0)
         return when {
             clampedBG < 80 -> 0.5
             clampedBG < 120 -> {
@@ -1688,8 +1771,10 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     return dynamicPeakTime.coerceIn(35.0, 120.0)
 }
 
-
-
+    fun detectMealOnset(delta: Float, predictedDelta: Float, acceleration: Float): Boolean {
+        val combinedDelta = (delta + predictedDelta) / 2.0f
+        return combinedDelta > 4.0f && acceleration > 1.0f
+    }
 
     private fun parseNotes(startMinAgo: Int, endMinAgo: Int): String {
         val olderTimeStamp = now - endMinAgo * 60 * 1000
@@ -1733,6 +1818,11 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             consoleLog = consoleLog,
             consoleError = consoleError
         )
+
+        val recentDeltas = getRecentDeltas()
+        val predicted = predictedDelta(recentDeltas)
+        // Calcul du delta combiné : on combine le delta mesuré et le delta prédit
+        val combinedDelta = (delta + predicted) / 2.0f
         val tp = calculateDynamicPeakTime(
             currentActivity = profile.currentActivity,
             futureActivity = profile.futureActivity,
@@ -1742,7 +1832,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             recentSteps15Minutes,
             averageBeatsPerMinute.toInt(),
             bg,
-            delta.toDouble()
+            combinedDelta.toDouble()
         )
 
         val autodrive = preferences.get(BooleanKey.OApsAIMIautoDrive)
@@ -1759,16 +1849,16 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         this.lastsmbtime = (diff / (60 * 1000)).toInt()
         this.maxIob = preferences.get(DoubleKey.ApsSmbMaxIob)
 // Tarciso Dynamic Max IOB
-        var DinMaxIob = ((bg / 100.0) * (bg / 55.0) + (delta / 2.0)).toFloat()
+        var DinMaxIob = ((bg / 100.0) * (bg / 55.0) + (combinedDelta / 2.0)).toFloat()
 
 // Calcul initial avec un ajustement dynamique basé sur bg et delta
-        DinMaxIob = ((bg / 100.0) * (bg / 55.0) + (delta / 2.0)).toFloat()
+        DinMaxIob = ((bg / 100.0) * (bg / 55.0) + (combinedDelta / 2.0)).toFloat()
 
 // Sécurisation : imposer une borne minimale et une borne maximale
         DinMaxIob = DinMaxIob.coerceAtLeast(1.0f).coerceAtMost(maxIob.toFloat() * 1.5f)
 
 // Réduction de l'augmentation si on est la nuit (0h-6h)
-        if (hourOfDay in 0..6) {
+        if (hourOfDay in 0..8) {
             DinMaxIob = DinMaxIob.coerceAtMost(maxIob.toFloat())
         }
 
@@ -1776,13 +1866,13 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         this.maxSMB = preferences.get(DoubleKey.OApsAIMIMaxSMB)
         this.maxSMBHB = preferences.get(DoubleKey.OApsAIMIHighBGMaxSMB)
         // Calcul initial avec ajustement basé sur la glycémie et le delta
-        var DynMaxSmb = ((bg / 200) * (bg / 100) + (delta / 2)).toFloat()
+        var DynMaxSmb = ((bg / 200) * (bg / 100) + (combinedDelta / 2)).toFloat()
 
 // ⚠ Sécurisation : bornes min/max pour éviter des valeurs extrêmes
         DynMaxSmb = DynMaxSmb.coerceAtLeast(0.1f).coerceAtMost(maxSMBHB.toFloat() * 2.5f)
 
 // ⚠ Ajustement si delta est négatif (la glycémie baisse) pour éviter un SMB trop fort
-        if (delta < 0) {
+        if (combinedDelta < 0) {
             DynMaxSmb *= 0.75f // Réduction de 25% si la glycémie baisse
         }
 
@@ -2350,17 +2440,18 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             }
         }
         this.predictedSMB = modelcal
+
         if (preferences.get(BooleanKey.OApsAIMIMLtraining) && csvfile.exists()){
             val allLines = csvfile.readLines()
             val minutesToConsider = 2500.0
             val linesToConsider = (minutesToConsider / 5).toInt()
             if (allLines.size > linesToConsider) {
-                val refinedSMB = neuralnetwork5(delta, shortAvgDelta, longAvgDelta, predictedSMB, profile)
+                val refinedSMB = neuralnetwork5(combinedDelta.toFloat(), shortAvgDelta, longAvgDelta, predictedSMB, profile)
                 this.predictedSMB = refinedSMB
                 if (bg > 200 && delta > 4 && iob < preferences.get(DoubleKey.ApsSmbMaxIob) ) {
-                    this.predictedSMB *= 1.5f // Augmente de 50% si montée très rapide
+                    this.predictedSMB *= 1.7f // Augmente de 70% si montée très rapide
                 } else if (bg > 180 && delta > 3 && iob < preferences.get(DoubleKey.ApsSmbMaxIob)) {
-                    this.predictedSMB *= 1.3f // Augmente de 30% si montée modérée
+                    this.predictedSMB *= 1.5f // Augmente de 50% si montée modérée
                 }
 
                 basal =
@@ -2375,7 +2466,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             rT.reason.append("ML Decision data training","ML decision has no enough data to refine the decision")
         }
 
-        var smbToGive = if (bg > 160  && delta > 8 && predictedSMB == 0.0f) modelcal else predictedSMB
+        var smbToGive = if (bg > 120  && delta > 8 && predictedSMB == 0.0f) modelcal else predictedSMB
         smbToGive = if (honeymoon && bg < 170) smbToGive * 0.8f else smbToGive
 
         val morningfactor: Double = preferences.get(DoubleKey.OApsAIMIMorningFactor) / 100.0
@@ -2698,7 +2789,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             appendLine("╔${"═".repeat(screenWidth)}╗")
             appendLine(String.format("║ %-${screenWidth}s ║", "AAPS-MASTER-AIMI"))
             appendLine(String.format("║ %-${screenWidth}s ║", "OpenApsAIMI Settings"))
-            appendLine(String.format("║ %-${screenWidth}s ║", "27 Feb 2025"))
+            appendLine(String.format("║ %-${screenWidth}s ║", "12 Mars 2025"))
             appendLine("╚${"═".repeat(screenWidth)}╝")
             appendLine()
 
@@ -2745,10 +2836,12 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             appendLine(String.format("║ %-${screenWidth}s ║", "Glucose Data"))
             appendLine("╠${"═".repeat(screenWidth)}╣")
             appendLine(String.format("║ %-${columnWidth}s │ %s mg/dL", "Current BG", String.format("%.1f", bg)))
+            appendLine(String.format("║ %-${columnWidth}s │ %s mg/dL", "predictedBg", String.format("%.1f", predictedBg)))
             appendLine(String.format("║ %-${columnWidth}s │ %s mg/dL", "Target BG", String.format("%.1f", targetBg)))
             appendLine(String.format("║ %-${columnWidth}s │ %s mg/dL", "Prediction", String.format("%.1f", predictedBg)))
             appendLine(String.format("║ %-${columnWidth}s │ %s mg/dL", "Eventual BG", String.format("%.1f", eventualBG)))
             appendLine(String.format("║ %-${columnWidth}s │ %s", "Delta", String.format("%.1f", delta)))
+            appendLine(String.format("║ %-${columnWidth}s │ %s", "combinedDelta", String.format("%.1f", combinedDelta)))
             appendLine(String.format("║ %-${columnWidth}s │ %s", "Short Δ", String.format("%.1f", shortAvgDelta)))
             appendLine(String.format("║ %-${columnWidth}s │ %s", "Long Δ", String.format("%.1f", longAvgDelta)))
             appendLine(String.format("║ %-${columnWidth}s │ %s", "slopeFromMaxDeviation", String.format("%.1f", mealData.slopeFromMaxDeviation)))
@@ -2843,6 +2936,23 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             }
         } else {
             var insulinReq = smbToGive.toDouble()
+            val recentBGValues: List<Float> = getRecentBGs()
+            val safetyDecision = safetyAdjustment(
+                currentBG = bg.toFloat(),
+                predictedBG = predictedBg,
+                bgHistory = recentBGValues,
+                combinedDelta = combinedDelta.toFloat(),
+                iob = iob,
+                maxIob = maxIob.toFloat(),
+                tdd24Hrs = tdd24Hrs,
+                tddPerHour = tddPerHour,
+                tirInhypo = currentTIRLow.toFloat(),
+                targetBG = targetBg
+            )
+            rT.reason.append(safetyDecision.reason)
+
+            // Ajustement de la dose SMB proposée en fonction du bolusFactor calculé
+            insulinReq = insulinReq * safetyDecision.bolusFactor
             insulinReq = round(insulinReq, 3)
             rT.insulinReq = insulinReq
             //console.error(iob_data.lastBolusTime);
@@ -2877,15 +2987,22 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             }
 
 // Calcul du facteur d'ajustement en fonction de la glycémie
-// (ici, on utilise la fonction simplifiée d'interpolation)
+// (ici, j'utilise la fonction simplifiée d'interpolation)
             val basalAdjustmentFactor = interpolatebasal(bg)
 
 // Calcul du taux basal final lissé à partir du TDD récent
             val finalBasalRate = computeFinalBasal(bg, tdd7P.toFloat(), tdd7Days.toFloat(), basalaimi)
 
-// On part du taux basal courant comme valeur de base
+// Taux basal courant comme valeur de base
             rate = profile_current_basal
-
+            if (safetyDecision.stopBasal) {
+                return setTempBasal(0.0, 30, profile, rT, currenttemp)
+            }
+            if (detectMealOnset(delta, predicted.toFloat(), bgAcceleration.toFloat()) && !mealTime && !lunchTime && !bfastTime && !dinnerTime && !sportTime && !snackTime && !highCarbTime && !sleepTime && !lowCarbTime) {
+                rT.reason.append("Détection précoce de repas: activation d'une basale maximale pendant 30 minutes. ")
+                val forcedBasal = profile_current_basal * 10  // Exemple, ajuster le facteur selon le profil
+                return setTempBasal(forcedBasal, 30, profile, rT, currenttemp)
+            }
             // 🔴 Sécurité : Arrêt de la basale en cas de tendance baissière ou IOB trop élevé
             if (bg < 110 && mealData.slopeFromMaxDeviation <= 0 || iob > maxIob) {
                 return setTempBasal(0.0, 30, profile, rT, currenttemp)
@@ -2896,21 +3013,21 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 bg < 80                                                                                                                  -> rate = 0.0
                 bg in 80.0..90.0 && slopeFromMaxDeviation <= 0 && iob > 0.1 && !sportTime                                                -> rate = 0.0
                 bg in 80.0..90.0 && slopeFromMinDeviation >= 0.3 && slopeFromMaxDeviation >= 0 &&
-                    delta in -1.0..2.0 && !sportTime && bgAcceleration.toFloat() > 0.0f                                                  -> rate = profile_current_basal * 0.2
+                    combinedDelta in -1.0..2.0 && !sportTime && bgAcceleration.toFloat() > 0.0f                                                  -> rate = profile_current_basal * 0.2
 
                 bg in 90.0..100.0 && slopeFromMinDeviation <= 0.3 && iob > 0.1 && !sportTime && bgAcceleration.toFloat() > 0.0f          -> rate = 0.0
-                bg in 90.0..100.0 && slopeFromMinDeviation >= 0.3 && delta in -1.0..2.0 && !sportTime && bgAcceleration.toFloat() > 0.0f -> rate = profile_current_basal * 0.5
+                bg in 90.0..100.0 && slopeFromMinDeviation >= 0.3 && combinedDelta in -1.0..2.0 && !sportTime && bgAcceleration.toFloat() > 0.0f -> rate = profile_current_basal * 0.5
             }
 
             // 🔺 Gestion des hausses lentes et rapides
-            if (bg > 120 && slopeFromMinDeviation in 0.4..20.0 && delta > 1 && shortAvgDelta >= 1 && !sportTime && bgAcceleration.toFloat() > 1.0f) {
-                rate = calculateBasalRate(finalBasalRate, profile_current_basal, delta.toDouble())
-            } else if (eventualBG > 110 && !sportTime && bg > 150 && delta in -2.0..15.0 && bgAcceleration.toFloat() > 0.0f) {
+            if (bg > 120 && slopeFromMinDeviation in 0.4..20.0 && combinedDelta > 1 && !sportTime && bgAcceleration.toFloat() > 1.0f) {
+                rate = calculateBasalRate(finalBasalRate, profile_current_basal, combinedDelta.toDouble())
+            } else if (eventualBG > 110 && !sportTime && bg > 150 && combinedDelta in -2.0..15.0 && bgAcceleration.toFloat() > 0.0f) {
                 rate = calculateBasalRate(finalBasalRate, profile_current_basal, basalAdjustmentFactor)
             }
 
             // 🔵 Gestion des horaires et activité
-            if ((timenow in 11..13 || timenow in 18..21) && iob < 0.8 && recentSteps5Minutes < 100 && delta > -1 && slopeFromMinDeviation > 0.3 && bgAcceleration.toFloat() > 0.0f) {
+            if ((timenow in 11..13 || timenow in 18..21) && iob < 0.8 && recentSteps5Minutes < 100 && combinedDelta > -1 && slopeFromMinDeviation > 0.3 && bgAcceleration.toFloat() > 0.0f) {
                 rate = profile_current_basal * 1.5
             } else if (timenow > sixAMHour && recentSteps5Minutes > 100) {
                 rate = 0.0
@@ -2947,9 +3064,9 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 when {
                     bg in 140.0..169.0 && delta > 0                                                                                             -> rate = profile_current_basal
                     bg > 170 && delta > 0                                                                                                       -> rate = calculateBasalRate(finalBasalRate, profile_current_basal, basalAdjustmentFactor)
-                    delta > 2 && bg in 90.0..119.0                                                                                              -> rate = profile_current_basal
-                    delta > 0 && bg > 110 && eventualBG > 120 && bg < 160                                                                       -> rate = profile_current_basal * basalAdjustmentFactor
-                    mealData.slopeFromMaxDeviation > 0 && mealData.slopeFromMinDeviation > 0 && bg > 110 && delta > 0                           -> rate = profile_current_basal * basalAdjustmentFactor
+                    combinedDelta > 2 && bg in 90.0..119.0                                                                                              -> rate = profile_current_basal
+                    combinedDelta > 0 && bg > 110 && eventualBG > 120 && bg < 160                                                                       -> rate = profile_current_basal * basalAdjustmentFactor
+                    mealData.slopeFromMaxDeviation > 0 && mealData.slopeFromMinDeviation > 0 && bg > 110 && combinedDelta > 0                           -> rate = profile_current_basal * basalAdjustmentFactor
                     mealData.slopeFromMaxDeviation in 0.0..0.2 && mealData.slopeFromMinDeviation in 0.0..0.5 && bg in 120.0..150.0 && delta > 0 -> rate = profile_current_basal * basalAdjustmentFactor
                     mealData.slopeFromMaxDeviation > 0 && mealData.slopeFromMinDeviation > 0 && bg in 100.0..120.0 && delta > 0                 -> rate = profile_current_basal * basalAdjustmentFactor
                 }
