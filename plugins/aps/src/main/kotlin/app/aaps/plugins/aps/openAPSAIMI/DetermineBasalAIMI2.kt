@@ -3,6 +3,8 @@ package app.aaps.plugins.aps.openAPSAIMI
 import android.annotation.SuppressLint
 import android.os.Environment
 import app.aaps.core.data.model.BS
+import app.aaps.core.data.model.TB
+import app.aaps.core.data.model.TE
 import app.aaps.core.data.model.UE
 import app.aaps.core.data.time.T
 import app.aaps.core.interfaces.aps.APSResult
@@ -16,6 +18,7 @@ import app.aaps.core.interfaces.aps.Predictions
 import app.aaps.core.interfaces.aps.RT
 import app.aaps.core.interfaces.db.PersistenceLayer
 import app.aaps.core.interfaces.iob.IobCobCalculator
+import app.aaps.core.interfaces.plugin.ActivePlugin
 import app.aaps.core.interfaces.profile.ProfileFunction
 import app.aaps.core.interfaces.profile.ProfileUtil
 import app.aaps.core.interfaces.stats.TddCalculator
@@ -37,6 +40,7 @@ import java.time.format.DateTimeFormatter
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.abs
@@ -45,6 +49,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 @Singleton
 class DetermineBasalaimiSMB2 @Inject constructor(
@@ -58,6 +63,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     @Inject lateinit var dateUtil: DateUtil
     @Inject lateinit var profileFunction: ProfileFunction
     @Inject lateinit var iobCobCalculator: IobCobCalculator
+    @Inject lateinit var activePlugin: ActivePlugin
     private val consoleError = mutableListOf<String>()
     private val consoleLog = mutableListOf<String>()
     private val externalDir = File(Environment.getExternalStorageDirectory().absolutePath + "/Documents/AAPS")
@@ -144,23 +150,40 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     private var intervalsmb = 1
     private var peakintermediaire = 0.0
     private var insulinPeakTime = 0.0
+    private var zeroBasalAccumulatedMinutes: Int = 0
+    private val MAX_ZERO_BASAL_DURATION = 60  // Durée maximale autorisée en minutes à 0 basal
 
     private fun Double.toFixed2(): String = DecimalFormat("0.00#").format(round(this, 2))
 
     private fun roundBasal(value: Double): Double = value
+    fun getZeroBasalDuration(persistenceLayer: PersistenceLayer, lookBackHours: Int): Int {
+        val now = System.currentTimeMillis()
+        // Définir la période de recherche (par exemple, les 12 dernières heures)
+        val fromTime = now - lookBackHours * 60 * 60 * 1000L
 
-    // private fun convertGlucoseToCurrentUnit(value: Double): Double {
-    //     return if (profileFunction.getUnits() == GlucoseUnit.MMOL) {
-    //         value * MGDL_TO_MMOL
-    //     } else {
-    //         value
-    //     }
-    // }
+        // Récupérer la liste des événements de basale temporaire à partir de "fromTime"
+        // Ici, on utilise blockingGet() pour simplifier l'exemple.
+        val tempBasals: List<TB> = persistenceLayer.getTemporaryBasalsStartingFromTime(fromTime, ascending = false)
+            .blockingGet()
+
+        // Filtrer les événements dont le taux basal est proche de zéro (ici, on considère <= 0.05 U/h comme zéro)
+        val zeroBasals = tempBasals.filter { it.rate <= 0.05 }
+        if (zeroBasals.isEmpty()) {
+            return 0
+        }
+
+        // Trouver l'événement le plus récent (avec le plus grand timestamp)
+        val lastZeroBasal = zeroBasals.maxByOrNull { it.timestamp } ?: return 0
+
+        // Calculer la durée écoulée (en minutes) depuis le timestamp de cet événement jusqu'à maintenant
+        return ((now - lastZeroBasal.timestamp) / 60000L).toInt()
+    }
 // -- Classe représentant la décision de sécurité --
     data class SafetyDecision(
         val stopBasal: Boolean,      // true => arrête la basale (ou force une basale à 0)
         val bolusFactor: Double,     // Facteur multiplicateur appliqué à la dose SMB (1.0 = dose complète, 0.0 = annulation)
-        val reason: String           // Log résumant les critères ayant conduit à la décision
+        val reason: String,           // Log résumant les critères ayant conduit à la décision
+        val basalLS: Boolean
     )
 
     // -- Calcul de la chute de BG par heure sur une fenêtre donnée (en minutes) --
@@ -181,7 +204,8 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         tdd24Hrs: Float,
         tddPerHour: Float,
         tirInhypo: Float,
-        targetBG: Float
+        targetBG: Float,
+        zeroBasalDurationMinutes: Int  // Nouvel argument indiquant combien de minutes consécutives la basale est restée à 0
     ): SafetyDecision {
         val windowMinutes = 30f
         val dropPerHour = calculateDropPerHour(bgHistory, windowMinutes)
@@ -189,6 +213,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
 
         val reasonBuilder = StringBuilder()
         var stopBasal = false
+        var basalLS = false
         var bolusFactor = 1.0
 
         // 1. Contrôle de la chute
@@ -247,27 +272,124 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             bolusFactor *= 0.5
             reasonBuilder.append("BG prédit ($predictedBG) proche de la cible ($targetBG), réduction x0.5; ")
         }
+        // ---- Intégration du suivi de durée zéro basal ----
+        // Si nous avons déjà trop longtemps de basal à 0, on ne souhaite pas stopper la basale.
+        // Par exemple, si la durée cumulée dépasse 60 minutes, on force l'arrêt de la réduction (i.e. on ne stoppe pas la basale)
+        if (zeroBasalDurationMinutes >= MAX_ZERO_BASAL_DURATION) {
+            // On annule la demande de stopper la basale et on force le bolusFactor à 1 (aucune réduction)
+            stopBasal = false
+            basalLS = true
+            bolusFactor = 1.0
+            reasonBuilder.append("Zero basal duration ($zeroBasalDurationMinutes min) dépassé, forçant basal minimal; ")
+        }
 
         return SafetyDecision(
             stopBasal = stopBasal,
             bolusFactor = bolusFactor,
-            reason = reasonBuilder.toString()
+            reason = reasonBuilder.toString(),
+            basalLS = basalLS
         )
     }
+    /**
+     * Ajuste le DIA (en minutes) en fonction du niveau d'IOB.
+     *
+     * @param diaMinutes Le DIA courant (en minutes) après les autres ajustements.
+     * @param currentIOB La quantité actuelle d'insuline active (U).
+     * @param threshold Le seuil d'IOB à partir duquel on commence à augmenter le DIA (par défaut 7 U).
+     * @return Le DIA ajusté en minutes tenant compte de l'impact de l'IOB.
+     */
+    fun adjustDIAForIOB(diaMinutes: Float, currentIOB: Float, threshold: Float = 5f): Float {
+        // Si l'IOB est inférieur ou égal au seuil, pas d'ajustement.
+        if (currentIOB <= threshold) return diaMinutes
 
+        // Calculer l'excès d'IOB
+        val excess = currentIOB - threshold
+        // Pour chaque unité au-dessus du seuil, augmenter le DIA de 5 %.
+        val multiplier = 1 + 0.05f * excess
+        return diaMinutes * multiplier
+    }
+    /**
+     * Calcule le DIA ajusté en minutes en fonction de plusieurs paramètres :
+     * - baseDIAHours : le DIA de base en heures (par exemple, 9.0 pour 9 heures)
+     * - currentHour : l'heure actuelle (0 à 23)
+     * - recentSteps5Minutes : nombre de pas sur les 5 dernières minutes
+     * - currentHR : fréquence cardiaque actuelle (bpm)
+     * - averageHR60 : fréquence cardiaque moyenne sur les 60 dernières minutes (bpm)
+     *
+     * La logique appliquée :
+     * 1. Conversion du DIA de base en minutes.
+     * 2. Ajustement selon l'heure de la journée :
+     *    - Matin (6-10h) : réduction de 20% (×0.8),
+     *    - Soir/Nuit (22-23h et 0-5h) : augmentation de 20% (×1.2).
+     * 3. Ajustement en fonction de l'activité physique :
+     *    - Si recentSteps5Minutes > 200 et que currentHR > averageHR60, on réduit le DIA de 30% (×0.7).
+     *    - Si recentSteps5Minutes == 0 et que currentHR > averageHR60, on augmente le DIA de 30% (×1.3).
+     * 4. Ajustement selon la fréquence cardiaque absolue :
+     *    - Si currentHR > 130 bpm, on réduit le DIA de 30% (×0.7).
+     * 5. Le résultat final est contraint entre 180 minutes (3h) et 720 minutes (12h).
+     */
+    fun calculateAdjustedDIA(
+        baseDIAHours: Float,
+        currentHour: Int,
+        recentSteps5Minutes: Int,
+        currentHR: Float,
+        averageHR60: Float,
+        pumpAgeDays: Float
+    ): Double {
+        // 1. Conversion du DIA de base en minutes
+        var diaMinutes = baseDIAHours * 60f  // Pour 9h, 9*60 = 540 min
+
+        // 2. Ajustement selon l'heure de la journée
+        if (currentHour in 6..10) {
+            // Le matin : absorption plus rapide, on réduit le DIA de 20%
+            diaMinutes *= 0.8f
+        } else if (currentHour in 22..23 || currentHour in 0..5) {
+            // Soir/Nuit : absorption plus lente, on augmente le DIA de 20%
+            diaMinutes *= 1.2f
+        }
+
+        // 3. Ajustement en fonction de l'activité physique
+        if (recentSteps5Minutes > 200 && currentHR > averageHR60) {
+            // Exercice : absorption accélérée, réduire le DIA de 30%
+            diaMinutes *= 0.7f
+        } else if (recentSteps5Minutes == 0 && currentHR > averageHR60) {
+            // Aucune activité mais HR élevée (stress) : absorption potentiellement plus lente, augmenter le DIA de 30%
+            diaMinutes *= 1.3f
+        }
+
+        // 4. Ajustement en fonction du niveau absolu de fréquence cardiaque
+        if (currentHR > 130f) {
+            // HR très élevée : circulation rapide, réduire le DIA de 30%
+            diaMinutes *= 0.7f
+        }
+
+        // 5. Ajustement en fonction de l'IOB
+        diaMinutes = adjustDIAForIOB(diaMinutes, iob)
+        // Si le site est utilisé depuis 2 jours ou plus, augmenter le DIA de 10% par jour supplémentaire.
+        if (pumpAgeDays >= 2f) {
+            val extraDays = pumpAgeDays - 2f
+            val ageMultiplier = 1 + 0.2f * extraDays  // par exemple, 2 jours => 1 + 0.2*1 = 1.2
+            diaMinutes *= ageMultiplier
+        }
+
+        // 6. Contrainte de la plage finale : entre 180 min (3h) et 720 min (12h)
+        diaMinutes = diaMinutes.coerceIn(180f, 720f)
+
+        return diaMinutes.toDouble()
+    }
 
     // -- Méthode pour obtenir l'historique récent de BG, similaire à getRecentDeltas() --
     private fun getRecentBGs(): List<Float> {
         val data = iobCobCalculator.ads.getBucketedDataTableCopy() ?: return emptyList()
         if (data.isEmpty()) return emptyList()
-
+        val intervalMinutes = if (bg < 130) 60f else 30f
         val nowTimestamp = data.first().timestamp
         val recentBGs = mutableListOf<Float>()
 
         for (i in 1 until data.size) {
             if (data[i].value > 39 && !data[i].filledGap) {
                 val minutesAgo = ((nowTimestamp - data[i].timestamp) / (1000.0 * 60)).toFloat()
-                if (minutesAgo in 1.0f..30.0f) {
+                if (minutesAgo in 1.0f..intervalMinutes) {
                     // Utilisation de la valeur recalculée comme BG
                     recentBGs.add(data[i].recalculated.toFloat())
                 }
@@ -300,13 +422,13 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     private fun convertBG(value: Double): String =
         profileUtil.fromMgdlToStringInUnits(value).replace("-0.0", "0.0")
 
-    private fun enablesmb(profile: OapsProfileAimi, microBolusAllowed: Boolean, mealData: MealData, target_bg: Double): Boolean {
+    private fun enablesmb(profile: OapsProfileAimi, microBolusAllowed: Boolean, mealData: MealData, targetbg: Double): Boolean {
         // disable SMB when a high temptarget is set
         if (!microBolusAllowed) {
             consoleError.add("SMB disabled (!microBolusAllowed)")
             return false
-        } else if (!profile.allowSMB_with_high_temptarget && profile.temptargetSet && target_bg > 100) {
-            consoleError.add("SMB disabled due to high temptarget of $target_bg")
+        } else if (!profile.allowSMB_with_high_temptarget && profile.temptargetSet && targetbg > 100) {
+            consoleError.add("SMB disabled due to high temptarget of $targetbg")
             return false
         }
 
@@ -330,8 +452,8 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         }
 
         // enable SMB/UAM (if enabled in preferences) if a low temptarget is set
-        if (profile.enableSMB_with_temptarget && (profile.temptargetSet && target_bg < 100)) {
-            consoleError.add("SMB enabled for temptarget of ${convertBG(target_bg)}")
+        if (profile.enableSMB_with_temptarget && (profile.temptargetSet && targetbg < 100)) {
+            consoleError.add("SMB enabled for temptarget of ${convertBG(targetbg)}")
             return true
         }
 
@@ -516,41 +638,45 @@ class DetermineBasalaimiSMB2 @Inject constructor(
 
         return result
     }
-    private fun hasReceivedPbolusMInLastHour(pbolusM: Double): Boolean {
+    private fun hasReceivedPbolusMInLastHour(pbolusA: Double): Boolean {
         // Récupère tous les bolus de la dernière heure
         val bolusesLastHour = persistenceLayer
             .getBolusesFromTime(dateUtil.now() - T.hours(1).msecs(), true)
             .blockingGet()
-        // Vérifie si un bolus a exactement le montant pbolusM
-        return bolusesLastHour.any { it.amount == pbolusM }
+        // Vérifie si un bolus a exactement le montant pbolusA
+        return bolusesLastHour.any { it.amount == pbolusA }
     }
-    private fun isMealModeCondition2(
+    private fun isAutodriveModeCondition(
         variableSensitivity: Float,
         targetBg: Float,
         delta: Float,
-        shortAvgDelta: Float,
         autodrive: Boolean,
         slopeFromMinDeviation: Double,
         bg: Float
     ): Boolean {
         // Récupération de la valeur de pbolusMeal depuis les préférences
-        val pbolusM: Double = preferences.get(DoubleKey.OApsAIMIMealPrebolus)
+        val pbolusA: Double = preferences.get(DoubleKey.OApsAIMIautodrivePrebolus)
+        val autodriveDelta: Double = preferences.get(DoubleKey.OApsAIMIcombinedDelta)
+        val autodriveminDeviation: Double = preferences.get(DoubleKey.OApsAIMIAutodriveDeviation)
+        val autodriveISF: Int = preferences.get(IntKey.OApsAIMIautodriveISF)
+        val autodriveTarget: Int = preferences.get(IntKey.OApsAIMIAutodriveTarget)
+        val autodriveBG: Int = preferences.get(IntKey.OApsAIMIAutodriveBG)
         // Récupération des deltas récents et calcul du delta prédit
         val recentDeltas = getRecentDeltas()
         val predicted = predictedDelta(recentDeltas)
         // Calcul du delta combiné : combine le delta mesuré et le delta prédit
         val combinedDelta = (delta + predicted) / 2.0f
-        // Si un bolus de pbolusM a déjà été administré dans la dernière heure, on ne le ré-administrera pas
-        if (hasReceivedPbolusMInLastHour(pbolusM)) {
+        // Si un bolus de pbolusA a déjà été administré dans la dernière heure, on ne le ré-administrera pas
+        if (hasReceivedPbolusMInLastHour(pbolusA)) {
             return false
         }
 
-        return variableSensitivity in 5.0f..10f &&
-            targetBg in 70.0f..85.0f &&
-            combinedDelta >= 4 &&
+        return variableSensitivity <= autodriveISF &&
+            targetBg <= autodriveTarget &&
+            combinedDelta >= autodriveDelta &&
             autodrive &&
-            slopeFromMinDeviation >= 1.5 &&
-            bg > 120
+            slopeFromMinDeviation >= autodriveminDeviation &&
+            bg >= autodriveBG
     }
 
     private fun isMealModeCondition(): Boolean {
@@ -837,28 +963,146 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         return smbToGive.toFloat()
     }
 
-    private fun neuralnetwork5(
+//     private fun neuralnetwork5(
+//     delta: Float,
+//     shortAvgDelta: Float,
+//     longAvgDelta: Float,
+//     predictedSMB: Float,
+//     profile: OapsProfileAimi
+// ): Float {
+//     val maxIterations = 1000.0
+//     // Valeur initiale de SMB calculée ailleurs (votre logique existante)
+//     var finalRefinedSMB: Float = calculateSMBFromModel()
+//     // 2) Lecture du CSV
+//     val allLines = csvfile.readLines()
+//     println("CSV file path: ${csvfile.absolutePath}")
+//     if (allLines.isEmpty()) {
+//         println("CSV file is empty.")
+//         return predictedSMB
+//     }
+//     val headerLine = allLines.first()
+//     val headers = headerLine.split(",").map { it.trim() }
+//     val requiredColumns = listOf(
+//         "bg", "iob", "cob", "delta", "shortAvgDelta", "longAvgDelta",
+//         "tdd7DaysPerHour", "tdd2DaysPerHour", "tddPerHour", "tdd24HrsPerHour",
+//         "predictedSMB", "smbGiven"
+//     )
+//     if (!requiredColumns.all { headers.contains(it) }) {
+//         println("CSV file is missing required columns.")
+//         return predictedSMB
+//     }
+//     // 3) Préparation des données
+//     val colIndices = requiredColumns.map { headers.indexOf(it) }
+//     val targetColIndex = headers.indexOf("smbGiven")
+//     val inputs = mutableListOf<FloatArray>()
+//     val targets = mutableListOf<DoubleArray>()
+//     var lastEnhancedInput: FloatArray? = null
+//     for (line in allLines.drop(1)) {
+//         val cols = line.split(",").map { it.trim() }
+//         val rawInput = colIndices.mapNotNull { idx -> cols.getOrNull(idx)?.toFloatOrNull() }.toFloatArray()
+//         val trendIndicator = calculateTrendIndicator(
+//             delta, shortAvgDelta, longAvgDelta,
+//             bg.toFloat(), iob, variableSensitivity, cob, normalBgThreshold,
+//             recentSteps180Minutes, averageBeatsPerMinute.toFloat(), averageBeatsPerMinute10.toFloat(),
+//             profile.insulinDivisor.toFloat(), recentSteps5Minutes, recentSteps10Minutes
+//         )
+//         val enhancedInput = rawInput.copyOf(rawInput.size + 1)
+//         enhancedInput[rawInput.size] = trendIndicator.toFloat()
+//         lastEnhancedInput = enhancedInput
+//
+//         val targetValue = cols.getOrNull(targetColIndex)?.toDoubleOrNull()
+//         if (targetValue != null) {
+//             inputs.add(enhancedInput)
+//             targets.add(doubleArrayOf(targetValue))
+//         }
+//     }
+//     if (inputs.isEmpty() || targets.isEmpty()) {
+//         println("Insufficient data for training.")
+//         return predictedSMB
+//     }
+//     // 4) Cross-validation (k-fold)
+//     val maxK = 10
+//     val adjustedK = minOf(maxK, inputs.size)
+//     val foldSize = maxOf(1, inputs.size / adjustedK)
+//     var bestNetwork: AimiNeuralNetwork? = null
+//     var bestFoldValLoss = Double.MAX_VALUE
+//     // 5) Training Config avec learning rate dynamique
+//     val adjustedLearningRate = if (bestFoldValLoss < 0.01) 0.0005 else 0.001
+//     val epochs = if (bestFoldValLoss < 0.01) 500 else 1000
+//     val trainingConfig = TrainingConfig(
+//         learningRate = adjustedLearningRate,
+//         beta1 = 0.9,
+//         beta2 = 0.999,
+//         epsilon = 1e-8,
+//         patience = 10,
+//         batchSize = 32,
+//         weightDecay = 0.01,
+//         epochs = epochs,
+//         useBatchNorm = false,
+//         useDropout = true,
+//         dropoutRate = 0.3,
+//         leakyReluAlpha = 0.01
+//     )
+//     // 6) Entraînement & validation
+//     for (k in 0 until adjustedK) {
+//         val validationInputs = inputs.subList(k * foldSize, minOf((k + 1) * foldSize, inputs.size))
+//         val validationTargets = targets.subList(k * foldSize, minOf((k + 1) * foldSize, targets.size))
+//         val trainingInputs = inputs.minus(validationInputs)
+//         val trainingTargets = targets.minus(validationTargets)
+//         if (validationInputs.isEmpty()) continue
+//         val neuralNetwork = AimiNeuralNetwork(
+//             inputSize = inputs.first().size,
+//             hiddenSize = 5,
+//             outputSize = 1,
+//             config = trainingConfig,
+//             regularizationLambda = 0.01
+//         )
+//
+//         neuralNetwork.trainWithValidation(trainingInputs, trainingTargets, validationInputs, validationTargets)
+//         val foldValLoss = neuralNetwork.validate(validationInputs, validationTargets)
+//
+//         if (foldValLoss < bestFoldValLoss) {
+//             bestFoldValLoss = foldValLoss
+//             bestNetwork = neuralNetwork
+//         }
+//     }
+//     // 7) Optimisation finale
+//     var iterationCount = 0
+//     do {
+//         val dynamicThreshold = calculateDynamicThreshold(iterationCount, delta, shortAvgDelta, longAvgDelta)
+//         val refinedSMB = bestNetwork?.let {
+//             AimiNeuralNetwork.refineSMB(finalRefinedSMB, it, lastEnhancedInput?.toDoubleArray() ?: DoubleArray(0))
+//         } ?: finalRefinedSMB
+//
+//         if (abs(finalRefinedSMB - refinedSMB) <= dynamicThreshold) {
+//             finalRefinedSMB = max(0.05f, refinedSMB) // Clamp SMB minimum
+//             break
+//         }
+//         iterationCount++
+//     } while (iterationCount < maxIterations)
+//
+//     // 8) Condition spéciale sur finalRefinedSMB
+//     if (finalRefinedSMB > predictedSMB && bg > 150 && delta > 5) {
+//         println("Modèle prédictif plus élevé, ajustement retenu.")
+//         return finalRefinedSMB
+//     }
+//     // 9) Lissage entre predictedSMB et finalRefinedSMB
+//     val alpha = 0.7f
+//     val blendedSMB = alpha * finalRefinedSMB + (1 - alpha) * predictedSMB
+//     return blendedSMB
+// }
+private fun neuralnetwork5(
     delta: Float,
     shortAvgDelta: Float,
     longAvgDelta: Float,
     predictedSMB: Float,
     profile: OapsProfileAimi
 ): Float {
-    // 1) Configuration générale
-    //val minutesToConsider = 5760.0
-    //val linesToConsider = (minutesToConsider / 5).toInt()
-    val maxIterations = 1000.0
-    //val maxGlobalIterations = 5
-    //var globalConvergenceReached = false
-    //var differenceWithinRange = false
-
-    // Valeur initiale de SMB calculée ailleurs (votre logique existante)
+    val maxIterations = 50.0  // Réduit pour éviter les boucles trop longues
     var finalRefinedSMB: Float = calculateSMBFromModel()
 
-    // 2) Lecture du CSV
     val allLines = csvfile.readLines()
-    println("CSV file path: ${csvfile.absolutePath}")
-
+    println("CSV file path: \${csvfile.absolutePath}")
     if (allLines.isEmpty()) {
         println("CSV file is empty.")
         return predictedSMB
@@ -871,16 +1115,13 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         "tdd7DaysPerHour", "tdd2DaysPerHour", "tddPerHour", "tdd24HrsPerHour",
         "predictedSMB", "smbGiven"
     )
-
     if (!requiredColumns.all { headers.contains(it) }) {
         println("CSV file is missing required columns.")
         return predictedSMB
     }
 
-    // 3) Préparation des données
     val colIndices = requiredColumns.map { headers.indexOf(it) }
     val targetColIndex = headers.indexOf("smbGiven")
-
     val inputs = mutableListOf<FloatArray>()
     val targets = mutableListOf<DoubleArray>()
     var lastEnhancedInput: FloatArray? = null
@@ -912,82 +1153,98 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         return predictedSMB
     }
 
-    // 4) Cross-validation (k-fold)
     val maxK = 10
     val adjustedK = minOf(maxK, inputs.size)
     val foldSize = maxOf(1, inputs.size / adjustedK)
-
     var bestNetwork: AimiNeuralNetwork? = null
     var bestFoldValLoss = Double.MAX_VALUE
 
-    // 5) Training Config avec learning rate dynamique
-    val adjustedLearningRate = if (bestFoldValLoss < 0.01) 0.0005 else 0.001
-    val epochs = if (bestFoldValLoss < 0.01) 500 else 1000
-
-    val trainingConfig = TrainingConfig(
-        learningRate = adjustedLearningRate,
-        beta1 = 0.9,
-        beta2 = 0.999,
-        epsilon = 1e-8,
-        patience = 10,
-        batchSize = 32,
-        weightDecay = 0.01,
-        epochs = epochs,
-        useBatchNorm = false,
-        useDropout = true,
-        dropoutRate = 0.3,
-        leakyReluAlpha = 0.01
-    )
-
-    // 6) Entraînement & validation
     for (k in 0 until adjustedK) {
         val validationInputs = inputs.subList(k * foldSize, minOf((k + 1) * foldSize, inputs.size))
         val validationTargets = targets.subList(k * foldSize, minOf((k + 1) * foldSize, targets.size))
-
         val trainingInputs = inputs.minus(validationInputs)
         val trainingTargets = targets.minus(validationTargets)
-
         if (validationInputs.isEmpty()) continue
 
-        val neuralNetwork = AimiNeuralNetwork(
+        val tempNetwork = AimiNeuralNetwork(
             inputSize = inputs.first().size,
             hiddenSize = 5,
             outputSize = 1,
-            config = trainingConfig,
+            config = TrainingConfig(
+                learningRate = 0.001,
+                epochs = 200
+            ),
             regularizationLambda = 0.01
         )
 
-        neuralNetwork.trainWithValidation(trainingInputs, trainingTargets, validationInputs, validationTargets)
-        val foldValLoss = neuralNetwork.validate(validationInputs, validationTargets)
+        tempNetwork.trainWithValidation(trainingInputs, trainingTargets, validationInputs, validationTargets)
+        val foldValLoss = tempNetwork.validate(validationInputs, validationTargets)
 
         if (foldValLoss < bestFoldValLoss) {
             bestFoldValLoss = foldValLoss
-            bestNetwork = neuralNetwork
+            bestNetwork = tempNetwork
         }
     }
 
-    // 7) Optimisation finale
+    val adjustedLearningRate = if (bestFoldValLoss < 0.01) 0.0005 else 0.001
+    val epochs = if (bestFoldValLoss < 0.01) 100 else 200
+
+    if (bestNetwork != null) {
+        println("Réentraînement final avec les meilleurs hyperparamètres sur toutes les données...")
+        val finalNetwork = AimiNeuralNetwork(
+            inputSize = inputs.first().size,
+            hiddenSize = 5,
+            outputSize = 1,
+            config = TrainingConfig(
+                learningRate = adjustedLearningRate,
+                beta1 = 0.9,
+                beta2 = 0.999,
+                epsilon = 1e-8,
+                patience = 10,
+                batchSize = 32,
+                weightDecay = 0.01,
+                epochs = epochs,
+                useBatchNorm = false,
+                useDropout = true,
+                dropoutRate = 0.3,
+                leakyReluAlpha = 0.01
+            ),
+            regularizationLambda = 0.01
+        )
+        finalNetwork.copyWeightsFrom(bestNetwork)
+        finalNetwork.trainWithValidation(inputs, targets, inputs, targets)
+        bestNetwork = finalNetwork
+    }
+
+    // --- Normalisation légère sur lastEnhancedInput ---
+    fun normalize(input: FloatArray): FloatArray {
+        val mean = input.average().toFloat()
+        val std = input.map { (it - mean) * (it - mean) }.average().let { sqrt(it).toFloat().coerceAtLeast(1e-8f) }
+        return input.map { (it - mean) / std }.toFloatArray()
+    }
+
     var iterationCount = 0
     do {
         val dynamicThreshold = calculateDynamicThreshold(iterationCount, delta, shortAvgDelta, longAvgDelta)
+        val normalizedInput = lastEnhancedInput?.let { normalize(it) }?.toDoubleArray() ?: DoubleArray(0)
         val refinedSMB = bestNetwork?.let {
-            AimiNeuralNetwork.refineSMB(finalRefinedSMB, it, lastEnhancedInput?.toDoubleArray() ?: DoubleArray(0))
+            AimiNeuralNetwork.refineSMB(finalRefinedSMB, it, normalizedInput)
         } ?: finalRefinedSMB
 
+        println("→ Iteration $iterationCount | SMB=$finalRefinedSMB → $refinedSMB | Δ=${abs(finalRefinedSMB - refinedSMB)} | threshold=$dynamicThreshold")
+
         if (abs(finalRefinedSMB - refinedSMB) <= dynamicThreshold) {
-            finalRefinedSMB = max(0.05f, refinedSMB) // Clamp SMB minimum
+            finalRefinedSMB = max(0.05f, refinedSMB)
             break
         }
         iterationCount++
     } while (iterationCount < maxIterations)
 
-    // 8) Condition spéciale sur finalRefinedSMB
     if (finalRefinedSMB > predictedSMB && bg > 150 && delta > 5) {
         println("Modèle prédictif plus élevé, ajustement retenu.")
         return finalRefinedSMB
     }
 
-    // 9) Lissage entre predictedSMB et finalRefinedSMB
     val alpha = 0.7f
     val blendedSMB = alpha * finalRefinedSMB + (1 - alpha) * predictedSMB
     return blendedSMB
@@ -1000,16 +1257,13 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         longAvgDelta: Float
     ): Float {
         val baseThreshold = 2.5f
-
         // Réduit le seuil au fur et à mesure des itérations pour exiger une convergence plus fine
         val iterationFactor = 1.0f / (1 + iterationCount / 100)
-
         val trendFactor = when {
             delta > 8 || shortAvgDelta > 4 || longAvgDelta > 3 -> 0.5f
             delta < 5 && shortAvgDelta < 3 && longAvgDelta < 3 -> 1.5f
             else -> 1.0f
         }
-
         return baseThreshold * iterationFactor * trendFactor
     }
 
@@ -1019,7 +1273,6 @@ class DetermineBasalaimiSMB2 @Inject constructor(
 
     private fun calculateGFactor(delta: Float, lastHourTIRabove120: Double, bg: Float): Double {
         val honeymoon = preferences.get(BooleanKey.OApsAIMIhoneymoon)
-
         // 🔹 Facteurs initiaux (ajustés dynamiquement)
         var deltaFactor = when {
             bg > 140 && delta > 5 -> 2.0 // Réaction forte si la glycémie monte rapidement et est élevée
@@ -1028,7 +1281,6 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             bg < 120 && delta < 0 -> 0.6
             else -> 1.0 // Pas de variation significative
         }
-
         var bgFactor = when {
             bg > 140 -> 1.8 // Réduction forte si glycémie > 150 mg/dL
             bg > 120 -> 1.4 // Réduction modérée si > 120 mg/dL
@@ -1036,13 +1288,11 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             bg < 80  -> 0.5 // Augmente l'ISF si la glycémie est sous la cible
             else -> 0.9 // Légère augmentation de l'ISF
         }
-
         var tirFactor = when {
             lastHourTIRabove120 > 0.5 && bg > 120 -> 1.2 + lastHourTIRabove120 * 0.15 // Augmente si tendance à rester haut
             bg < 100 -> 0.8 // Augmente l'ISF si retour à une glycémie basse
             else -> 1.0
         }
-
         // 🔹 Mode "Honeymoon" (ajustements spécifiques)
         if (honeymoon) {
             deltaFactor = when {
@@ -1074,6 +1324,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
     private fun getRecentDeltas(): List<Double> {
         val data = iobCobCalculator.ads.getBucketedDataTableCopy() ?: return emptyList()
         if (data.isEmpty()) return emptyList()
+        val intervalMinutes = if (bg < 130) 20f else 10f
 
         val nowTimestamp = data.first().timestamp
         val recentDeltas = mutableListOf<Double>()
@@ -1081,7 +1332,8 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         for (i in 1 until data.size) {
             if (data[i].value > 39 && !data[i].filledGap) {
                 val minutesAgo = ((nowTimestamp - data[i].timestamp) / (1000.0 * 60)).toFloat()
-                if (minutesAgo in 0.0f..10.0f) {
+
+                if (minutesAgo in 0.0f..intervalMinutes) {
                     val delta = (data.first().recalculated - data[i].recalculated) / minutesAgo * 5f
                     recentDeltas.add(delta)
                 }
@@ -1118,8 +1370,8 @@ class DetermineBasalaimiSMB2 @Inject constructor(
 
         // Interpolation de base pour factorAdjustment selon la glycémie (bg)
         var factorAdjustment = when {
-            bg < 120 -> interpolateFactor(bg.toFloat(), 70f, 120f, 0.1f, 0.3f)
-            else -> interpolateFactor(bg.toFloat(), 120f, 280f, 0.75f, 2.5f)
+            bg < 110 -> interpolateFactor(bg.toFloat(), 70f, 110f, 0.1f, 0.3f)
+            else -> interpolateFactor(bg.toFloat(), 110f, 280f, 0.75f, 2.5f)
         }
         if (honeymoon) factorAdjustment = when {
             bg < 160 -> interpolateFactor(bg.toFloat(), 70f, 160f, 0.2f, 0.4f)
@@ -1129,13 +1381,14 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         bgAdjustment *= 1.2f
 
         val dynamicCorrection = when {
+            hourOfDay in 0..11 || hourOfDay in 15..19 || hourOfDay >= 22 -> 1.0f
             combinedDelta > 11f  -> 2.5f   // Très forte montée, on augmente très agressivement
             combinedDelta > 8f  -> 2.0f   // Montée forte
             combinedDelta > 4f  -> 1.5f   // Montée modérée à forte
-            combinedDelta > 2f  -> 0.8f   // Montée légère
-            combinedDelta in -2f..2f -> 1.0f  // Stable
-            combinedDelta < -2f && combinedDelta >= -4f -> 0.8f  // Baisse légère
-            combinedDelta < -4f && combinedDelta >= -6f -> 0.6f  // Baisse modérée
+            combinedDelta > 2f  -> 1.0f   // Montée légère
+            combinedDelta in -2f..2f -> 0.8f  // Stable
+            combinedDelta < -2f && combinedDelta >= -4f -> 0.7f  // Baisse légère
+            combinedDelta < -4f && combinedDelta >= -6f -> 0.5f  // Baisse modérée
             combinedDelta < -6f -> 0.4f   // Baisse forte, on diminue considérablement pour éviter l'hypo
             else -> 1.0f
         }
@@ -1347,153 +1600,13 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         }
     }
 
-
-    // private fun predictFutureBg(
-    //     bg: Float,
-    //     iob: Float,
-    //     variableSensitivity: Float,
-    //     mealTime: Boolean,
-    //     bfastTime: Boolean,
-    //     lunchTime: Boolean,
-    //     dinnerTime: Boolean,
-    //     highcarbTime: Boolean,
-    //     snackTime: Boolean
-    // ): Float {
-    //     val (averageCarbAbsorptionTime, carbTypeFactor, estimatedCob) = when {
-    //         highcarbTime -> Triple(3.5f, 0.75f, 100f) // Repas riche en glucides
-    //         snackTime -> Triple(1.5f, 1.25f, 15f) // Snack
-    //         mealTime -> Triple(2.5f, 1.0f, 55f) // Repas normal
-    //         bfastTime -> Triple(3.5f, 1.0f, 55f) // Petit-déjeuner
-    //         lunchTime -> Triple(2.5f, 1.0f, 70f) // Déjeuner
-    //         dinnerTime -> Triple(2.5f, 1.0f, 70f) // Dîner
-    //         else -> Triple(2.5f, 1.0f, 70f) // Valeur par défaut si aucun type de repas spécifié
-    //     }
-    //     val insulinEffect = calculateInsulinEffect(
-    //         bg, iob, variableSensitivity, cob, normalBgThreshold, recentSteps180Minutes,
-    //         averageBeatsPerMinute.toFloat(), averageBeatsPerMinute10.toFloat(), insulinPeakTime.toFloat()
-    //     )
-    //
-    //
-    //     val honeymoon = preferences.get(BooleanKey.OApsAIMIhoneymoon)
-    //     var futureBg = bg - insulinEffect
-    //     if (!honeymoon && futureBg < 39f) {
-    //         futureBg = 39f
-    //     } else if (honeymoon && futureBg < 50f) {
-    //         futureBg = 50f
-    //     }
-    //
-    //     return futureBg
-    // }
-    // private fun predictEventualBG(
-    //     bg: Float,                     // Glycémie actuelle
-    //     iob: Float,                    // Insuline active (IOB)
-    //     variableSensitivity: Float,    // Sensibilité insulinique
-    //     minDelta: Float,               // Delta minimal instantané (ex. dernière variation)
-    //     minAvgDelta: Float,            // Moyenne instantanée (court terme) des deltas
-    //     longAvgDelta: Float,           // Moyenne à plus long terme des deltas
-    //     mealTime: Boolean,
-    //     bfastTime: Boolean,
-    //     lunchTime: Boolean,
-    //     dinnerTime: Boolean,
-    //     highCarbTime: Boolean,
-    //     snackTime: Boolean,
-    //     honeymoon: Boolean
-    // ): Float {
-    //     // 1. Détermination des paramètres glucidiques en fonction du contexte (type de repas)
-    //     val (averageCarbAbsorptionTime, carbTypeFactor, estimatedCob) = when {
-    //         highCarbTime -> Triple(3.5f, 0.75f, 100f) // Repas riche en glucides
-    //         snackTime    -> Triple(1.5f, 1.25f, 15f)   // Snack
-    //         mealTime     -> Triple(2.5f, 1.0f, 55f)     // Repas standard
-    //         bfastTime    -> Triple(3.5f, 1.0f, 55f)     // Petit-déjeuner
-    //         lunchTime    -> Triple(2.5f, 1.0f, 70f)     // Déjeuner
-    //         dinnerTime   -> Triple(2.5f, 1.0f, 70f)     // Dîner
-    //         else         -> Triple(2.5f, 1.0f, 70f)     // Valeur par défaut
-    //     }
-    //
-    //     // 2. Calcul du temps d'absorption (en minutes) en fonction de l'heure actuelle
-    //     val currentHour = LocalTime.now().hour
-    //
-    //     // 3. Calcul de l'effet insuline (modèle simplifié)
-    //     val insulinEffect = iob * variableSensitivity
-    //
-    //
-    //     // 5. Calcul de la déviation basée sur la tendance
-    //     //    On utilise minDelta et, si nécessaire, on remplace par minAvgDelta ou longAvgDelta pour limiter l'effet négatif excessif.
-    //     var deviation = (30f / 5f) * (minDelta - bg)
-    //     if (deviation < 0) {
-    //         deviation = (30f / 5f) * (minAvgDelta - bg)
-    //         if (deviation < 0) {
-    //             deviation = (30f / 5f) * (longAvgDelta - bg)
-    //         }
-    //     }
-    //
-    //     // 6. Calcul de la prédiction naïve basée sur l'effet insuline
-    //     val naiveEventualBG = round((bg - insulinEffect).toDouble(), 0)
-    //     val predictedfuturBG = predictFutureBg(bg,iob,variableSensitivity,mealTime,bfastTime,lunchTime,dinnerTime,highCarbTime,snackTime)
-    //     val maxpred = max(naiveEventualBG.toFloat(),predictedfuturBG)
-    //     // 7. Combinaison des effets pour obtenir la glycémie prédite :
-    //     //    glycémie actuelle - effet insuline + effet glucidique + déviation (tendance)
-    //     val predictedBG = maxpred + deviation
-    //
-    //     // 8. Application d'un seuil minimal de sécurité :
-    //     //    - En mode non-honeymoon, ne pas prédire en dessous de 39 mg/dL
-    //     //    - En mode honeymoon, ne pas prédire en dessous de 50 mg/dL
-    //     val finalPredictedBG = when {
-    //         !honeymoon && predictedBG < 39f -> 39f
-    //         honeymoon && predictedBG < 50f   -> 50f
-    //         else                              -> predictedBG
-    //     }
-    //
-    //     return finalPredictedBG as Float
-    // }
-    private fun predictFutureBg(
-        bg: Float,
-        iob: Float,
-        variableSensitivity: Float,
-        mealTime: Boolean,
-        bfastTime: Boolean,
-        lunchTime: Boolean,
-        dinnerTime: Boolean,
-        highcarbTime: Boolean,
-        snackTime: Boolean
-    ): Float {
-        // Les paramètres glucidiques sont définis selon le contexte, même s'ils ne sont pas utilisés ici.
-        val (averageCarbAbsorptionTime, carbTypeFactor, estimatedCob) = when {
-            highcarbTime -> Triple(3.5f, 0.75f, 100f) // Repas riche en glucides
-            snackTime    -> Triple(1.5f, 1.25f, 15f)   // Snack
-            mealTime     -> Triple(2.5f, 1.0f, 55f)     // Repas normal
-            bfastTime    -> Triple(3.5f, 1.0f, 55f)     // Petit-déjeuner
-            lunchTime    -> Triple(2.5f, 1.0f, 70f)     // Déjeuner
-            dinnerTime   -> Triple(2.5f, 1.0f, 70f)     // Dîner
-            else         -> Triple(2.5f, 1.0f, 70f)     // Valeur par défaut
-        }
-
-        // Ici, on suppose que calculateInsulinEffect() est déjà calibré (même s'il utilise encore 'cob', etc.)
-        val insulinEffect = calculateInsulinEffect(
-            bg, iob, variableSensitivity, cob, normalBgThreshold, recentSteps180Minutes,
-            averageBeatsPerMinute.toFloat(), averageBeatsPerMinute10.toFloat(), insulinPeakTime.toFloat()
-        )
-
-        val honeymoon = preferences.get(BooleanKey.OApsAIMIhoneymoon)
-        var futureBg = bg - insulinEffect
-
-        // Sécurité : on ne prédit pas en dessous d'un certain seuil
-        if (!honeymoon && futureBg < 39f) {
-            futureBg = 39f
-        } else if (honeymoon && futureBg < 50f) {
-            futureBg = 50f
-        }
-
-        return futureBg
-    }
-
     private fun predictEventualBG(
-        bg: Float,                     // Glycémie actuelle
+        bg: Float,                     // Glycémie actuelle (mg/dL)
         iob: Float,                    // Insuline active (IOB)
-        variableSensitivity: Float,    // Sensibilité insulinique
-        minDelta: Float,               // Delta instantané (mg/dL par intervalle)
-        minAvgDelta: Float,            // Delta moyen court terme
-        longAvgDelta: Float,           // Delta moyen long terme
+        variableSensitivity: Float,    // Sensibilité insulinique (mg/dL/U)
+        minDelta: Float,               // Delta instantané (mg/dL/5min)
+        minAvgDelta: Float,            // Delta moyen court terme (mg/dL/5min)
+        longAvgDelta: Float,           // Delta moyen long terme (mg/dL/5min)
         mealTime: Boolean,
         bfastTime: Boolean,
         lunchTime: Boolean,
@@ -1502,7 +1615,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         snackTime: Boolean,
         honeymoon: Boolean
     ): Float {
-        // 1. Détermination des paramètres glucidiques en fonction du contexte (pour cohérence)
+        // 1. Détermination des paramètres glucidiques en fonction du contexte
         val (averageCarbAbsorptionTime, carbTypeFactor, estimatedCob) = when {
             highCarbTime -> Triple(3.5f, 0.75f, 100f)
             snackTime    -> Triple(1.5f, 1.25f, 15f)
@@ -1513,43 +1626,73 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             else         -> Triple(2.5f, 1.0f, 70f)
         }
 
-        // 2. (Optionnel) On pourrait calculer ici un temps d'absorption en fonction de l'heure, mais il n'est pas utilisé
+        // 2. Détermination du facteur d'absorption en fonction de l'heure de la journée
         val currentHour = LocalTime.now().hour
+        val absorptionFactor = when (currentHour) {
+            in 6..10 -> 1.3f
+            in 11..15 -> 0.8f
+            in 16..23 -> 1.2f
+            else -> 1.0f
+        }
 
-        // 3. Calcul de l'effet insuline (modèle simplifié)
+        // 3. Calcul de l'effet insuline
         val insulinEffect = iob * variableSensitivity
 
-        // 4. Calcul de la déviation basée sur la tendance
-        // L'idée est de prévoir l'effet sur 30 minutes (soit 6 intervalles de 5 minutes)
-        // On multiplie directement le delta par 6, sans soustraire bg qui était trop pénalisant.
-        var deviation = (30f / 5f) * minDelta  // 6 * minDelta
+        // 4. Calcul de la déviation basée sur la tendance sur 30 minutes
+        var deviation = (30f / 5f) * minDelta
+        deviation *= absorptionFactor * carbTypeFactor
         if (deviation < 0) {
-            deviation = (30f / 5f) * minAvgDelta
+            deviation = (30f / 5f) * minAvgDelta * absorptionFactor * carbTypeFactor
             if (deviation < 0) {
-                deviation = (30f / 5f) * longAvgDelta
+                deviation = (30f / 5f) * longAvgDelta * absorptionFactor * carbTypeFactor
             }
         }
 
-        // 5. Calcul de la prédiction naïve basée sur l'effet insuline
-        val naiveEventualBG = round((bg - insulinEffect).toDouble(), 0).toFloat()
-        // 6. Appel de predictFutureBg qui applique son propre modèle
-        val predictedFutureBG = predictFutureBg(bg, iob, variableSensitivity, mealTime, bfastTime, lunchTime, dinnerTime, highCarbTime, snackTime)
-        // On prend la valeur maximale entre les deux prédictions pour éviter d'être trop pessimiste.
-        val maxPred = max(naiveEventualBG, predictedFutureBG)
+        // 5. Prédiction alternative basée sur un modèle dédié qui prend aussi le contexte alimentaire
+        val predictedFutureBG = predictFutureBg(
+            bg, iob, variableSensitivity,
+            averageCarbAbsorptionTime, carbTypeFactor, estimatedCob,
+            honeymoon
+        )
 
-        // 7. Combinaison : on ajoute le décalage (déviation) à la meilleure estimation
-        val predictedBG = maxPred + deviation
+        // 6. Combinaison finale : effet insuline + tendance + impact COB
+        val predictedBG = predictedFutureBG + deviation + (estimatedCob * 0.05f)
 
-        // 8. Application d'un seuil minimal de sécurité
+        // 7. Seuil minimal de sécurité
         val finalPredictedBG = when {
             !honeymoon && predictedBG < 39f -> 39f
-            honeymoon && predictedBG < 50f   -> 50f
-            else                              -> predictedBG
+            honeymoon && predictedBG < 50f -> 50f
+            else -> predictedBG
         }
 
         return finalPredictedBG
     }
 
+    private fun predictFutureBg(
+        bg: Float,
+        iob: Float,
+        variableSensitivity: Float,
+        averageCarbAbsorptionTime: Float,
+        carbTypeFactor: Float,
+        estimatedCob: Float,
+        honeymoon: Boolean
+    ): Float {
+        // Prise en compte de l'effet insuline
+        val insulinEffect = iob * variableSensitivity
+
+        // Prise en compte d'une absorption glucidique estimée (simple modèle linéaire)
+        val carbImpact = (estimatedCob / averageCarbAbsorptionTime) * carbTypeFactor
+
+        var futureBg = bg - insulinEffect + carbImpact
+
+        if (!honeymoon && futureBg < 39f) {
+            futureBg = 39f
+        } else if (honeymoon && futureBg < 50f) {
+            futureBg = 50f
+        }
+
+        return futureBg
+    }
 
     private fun interpolatebasal(bg: Double): Double {
         val clampedBG = bg.coerceIn(80.0, 300.0)
@@ -1805,7 +1948,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         return notes
     }
 
-    @SuppressLint("NewApi") fun determine_basal(
+    @SuppressLint("NewApi", "DefaultLocale") fun determine_basal(
         glucose_status: GlucoseStatus, currenttemp: CurrentTemp, iob_data_array: Array<IobTotal>, profile: OapsProfileAimi, autosens_data: AutosensResult, mealData: MealData,
         microBolusAllowed: Boolean, currentTime: Long, flatBGsDetected: Boolean, dynIsfMode: Boolean
     ): RT {
@@ -1818,6 +1961,20 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             consoleLog = consoleLog,
             consoleError = consoleError
         )
+        // On définit fromTime pour couvrir une longue période (par exemple, les 7 derniers jours)
+        val fromTime = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(7)
+// Récupération des événements de changement de cannule
+        val siteChanges = persistenceLayer.getTherapyEventDataFromTime(fromTime, TE.Type.CANNULA_CHANGE, true)
+
+// Calcul de l'âge du site en jours
+        val pumpAgeDays: Float = if (siteChanges.isNotEmpty()) {
+            // On suppose que la liste est triée par ordre décroissant (le plus récent en premier)
+            val latestChangeTimestamp = siteChanges.last().timestamp
+            ((System.currentTimeMillis() - latestChangeTimestamp).toFloat() / (1000 * 60 * 60 * 24))
+        } else {
+            // Si aucun changement n'est enregistré, vous pouvez définir une valeur par défaut
+            0f
+        }
 
         val recentDeltas = getRecentDeltas()
         val predicted = predictedDelta(recentDeltas)
@@ -1858,7 +2015,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         DinMaxIob = DinMaxIob.coerceAtLeast(1.0f).coerceAtMost(maxIob.toFloat() * 1.5f)
 
 // Réduction de l'augmentation si on est la nuit (0h-6h)
-        if (hourOfDay in 0..8) {
+        if (hourOfDay in 0..11 || hourOfDay in 15..19 || hourOfDay >= 22) {
             DinMaxIob = DinMaxIob.coerceAtMost(maxIob.toFloat())
         }
 
@@ -1877,7 +2034,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         }
 
 // ⚠ Réduction nocturne pour éviter une surcorrection pendant le sommeil (0h - 6h)
-        if (hourOfDay in 0..8) {
+        if (hourOfDay in 0..11 || hourOfDay in 15..19 || hourOfDay >= 22) {
             DynMaxSmb *= 0.6f
         }
 
@@ -1964,16 +2121,17 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         this.acceleratingDown = if (delta < -2 && delta - longAvgDelta < -2) 1 else 0
         this.decceleratingDown = if (delta < 0 && (delta > shortAvgDelta || delta > longAvgDelta)) 1 else 0
         this.stable = if (delta>-3 && delta<3 && shortAvgDelta>-3 && shortAvgDelta<3 && longAvgDelta>-3 && longAvgDelta<3 && bg < 180) 1 else 0
-         if (isMealModeCondition()){
+        val AutodriveAcceleration = preferences.get(DoubleKey.OApsAIMIAutodriveAcceleration)
+        if (isMealModeCondition()){
              val pbolusM: Double = preferences.get(DoubleKey.OApsAIMIMealPrebolus)
                  rT.units = pbolusM
                  rT.reason.append("Microbolusing Meal Mode ${pbolusM}U. ")
              return rT
          }
-        if (isMealModeCondition2(variableSensitivity, targetBg, delta, shortAvgDelta, autodrive, mealData.slopeFromMinDeviation, bg.toFloat()) && !mealTime && !highCarbTime && !lunchTime && !bfastTime && !dinnerTime && !snackTime && !sportTime && !snackTime && !lowCarbTime && bgAcceleration.toFloat() >= 2.0f){
-            val pbolusM: Double = preferences.get(DoubleKey.OApsAIMIMealPrebolus)
-            rT.units = pbolusM
-            rT.reason.append("Microbolusing Meal Mode ${pbolusM}U. ")
+        if (isAutodriveModeCondition(variableSensitivity, targetBg, delta, autodrive, mealData.slopeFromMinDeviation, bg.toFloat()) && !mealTime && !highCarbTime && !lunchTime && !bfastTime && !dinnerTime && !snackTime && !sportTime && !snackTime && !lowCarbTime && bgAcceleration.toFloat() >= AutodriveAcceleration){
+            val pbolusA: Double = preferences.get(DoubleKey.OApsAIMIautodrivePrebolus)
+            rT.units = pbolusA
+            rT.reason.append("Microbolusing Autodrive Mode ${pbolusA}U. ")
             return rT
         }
         if (isbfastModeCondition()){
@@ -2094,8 +2252,11 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             !profile.temptargetSet && recentSteps5Minutes >= 0 && (recentSteps30Minutes >= 500 || recentSteps180Minutes > 1500) && recentSteps10Minutes > 0 -> {
                 this.targetBg = 130.0f
             }
-            !profile.temptargetSet && eventualBG >= 120 && delta > 3 -> {
+            !profile.temptargetSet && predictedBg >= 120 && combinedDelta > 3 -> {
                 var baseTarget = if (honeymoon) 110.0 else 70.0
+                if (hourOfDay in 0..11 || hourOfDay in 15..19 || hourOfDay >= 22){
+                    baseTarget = 90.0
+                }
                 var hyperTarget = max(baseTarget, profile.target_bg - (bg - profile.target_bg) / 3).toInt()
                 hyperTarget = (hyperTarget * min(circadianSensitivity, 1.0)).toInt()
                 hyperTarget = max(hyperTarget, baseTarget.toInt())
@@ -2109,19 +2270,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 sensitivityRatio = round(sensitivityRatio, 2)
                 consoleLog.add("Sensitivity ratio set to $sensitivityRatio based on temp target of $target_bg; ")
             }
-            !profile.temptargetSet && circadianSmb > 0.1 && eventualBG < 110 -> {
-                val baseHypoTarget = if (honeymoon) 130.0 else 120.0
-                val hypoTarget = baseHypoTarget * max(1.0, circadianSensitivity)
-                this.targetBg = min(hypoTarget.toFloat(), 166.0f)
-                target_bg = targetBg.toDouble()
-                val c = (halfBasalTarget - normalTarget).toDouble()
-                sensitivityRatio = c / (c + target_bg - normalTarget)
-                // limit sensitivityRatio to profile.autosens_max (1.2x by default)
-                sensitivityRatio = min(sensitivityRatio, profile.autosens_max)
-                sensitivityRatio = round(sensitivityRatio, 2)
-                consoleLog.add("Sensitivity ratio set to $sensitivityRatio based on temp target of $target_bg; ")
-            }
-            !profile.temptargetSet && bg < 110 && delta < 1 -> {
+            !profile.temptargetSet && combinedDelta <= 0 && predictedBg < 120 -> {
                 val baseHypoTarget = if (honeymoon) 130.0 else 110.0
                 val hypoTarget = baseHypoTarget * max(1.0, circadianSensitivity)
                 this.targetBg = min(hypoTarget.toFloat(), 166.0f)
@@ -2133,6 +2282,18 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 sensitivityRatio = round(sensitivityRatio, 2)
                 consoleLog.add("Sensitivity ratio set to $sensitivityRatio based on temp target of $target_bg; ")
             }
+            // !profile.temptargetSet && bg < 110 && delta < 1 -> {
+            //     val baseHypoTarget = if (honeymoon) 130.0 else 110.0
+            //     val hypoTarget = baseHypoTarget * max(1.0, circadianSensitivity)
+            //     this.targetBg = min(hypoTarget.toFloat(), 166.0f)
+            //     target_bg = targetBg.toDouble()
+            //     val c = (halfBasalTarget - normalTarget).toDouble()
+            //     sensitivityRatio = c / (c + target_bg - normalTarget)
+            //     // limit sensitivityRatio to profile.autosens_max (1.2x by default)
+            //     sensitivityRatio = min(sensitivityRatio, profile.autosens_max)
+            //     sensitivityRatio = round(sensitivityRatio, 2)
+            //     consoleLog.add("Sensitivity ratio set to $sensitivityRatio based on temp target of $target_bg; ")
+            // }
 
             else -> {
                 val defaultTarget = profile.target_bg
@@ -2522,11 +2683,20 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             bg > 120 && delta > 7 && !honeymoon -> hyperfactor
             else -> 1.0
         }
-
-
+        val currentHour = Calendar.getInstance()[Calendar.HOUR_OF_DAY]
+        // Calcul du DIA ajusté en minutes
+        val adjustedDIAInMinutes = calculateAdjustedDIA(
+            baseDIAHours = profile.dia.toFloat(),
+            currentHour = currentHour,
+            recentSteps5Minutes = recentSteps5Minutes,
+            currentHR = averageBeatsPerMinute.toFloat(),
+            averageHR60 = averageBeatsPerMinute60.toFloat(),
+            pumpAgeDays = pumpAgeDays
+        )
+        consoleLog.add("DIA ajusté (en minutes) : $adjustedDIAInMinutes")
         val actCurr = profile.sensorLagActivity
         val actFuture = profile.futureActivity
-        val td = profile.dia * 60
+        val td = adjustedDIAInMinutes
         val deltaGross = round((glucose_status.delta + actCurr * sens).coerceIn(0.0, 35.0), 1)
         val actTarget = deltaGross / sens * factors.toFloat()
         var actMissing = 0.0
@@ -2587,13 +2757,13 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         var remainingCATimeMin = 2.0
         remainingCATimeMin = remainingCATimeMin / sensitivityRatio
         var remainingCATime = remainingCATimeMin
-        val totalCI = Math.max(0.0, ci / 5 * 60 * remainingCATime / 2)
+        val totalCI = max(0.0, ci / 5 * 60 * remainingCATime / 2)
         // totalCI (mg/dL) / CSF (mg/dL/g) = total carbs absorbed (g)
         val totalCA = totalCI / csf
         val remainingCarbsCap: Int // default to 90
         remainingCarbsCap = min(90, profile.remainingCarbsCap)
         var remainingCarbs = max(0.0, mealData.mealCOB - totalCA)
-        remainingCarbs = Math.min(remainingCarbsCap.toDouble(), remainingCarbs)
+        remainingCarbs = min(remainingCarbsCap.toDouble(), remainingCarbs)
         val remainingCIpeak = remainingCarbs * csf * 5 / 60 / (remainingCATime / 2)
         val slopeFromMaxDeviation = mealData.slopeFromMaxDeviation
         val slopeFromMinDeviation = mealData.slopeFromMinDeviation
@@ -2683,10 +2853,10 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             //console.error(predBGI, predCI, predUCI);
             // truncate all BG predictions at 4 hours
             if (IOBpredBGs.size < 24) IOBpredBGs.add(IOBpredBG)
-            if (UAMpredBGs.size < 24) UAMpredBGs.add(UAMpredBG!!)
+            if (UAMpredBGs.size < 24) UAMpredBGs.add(UAMpredBG)
             if (ZTpredBGs.size < 24) ZTpredBGs.add(ZTpredBG)
             // calculate minGuardBGs without a wait from COB, UAM, IOB predBGs
-            if (UAMpredBG!! < minUAMGuardBG) minUAMGuardBG = round(UAMpredBG!!).toDouble()
+            if (UAMpredBG < minUAMGuardBG) minUAMGuardBG = round(UAMpredBG).toDouble()
             if (IOBpredBG < minIOBGuardBG) minIOBGuardBG = IOBpredBG
             if (ZTpredBG < minZTGuardBG) minZTGuardBG = round(ZTpredBG, 0)
 
@@ -2700,7 +2870,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             // wait 90m before setting minIOBPredBG
             if (IOBpredBGs.size > insulinPeak5m && (IOBpredBG < minIOBPredBG)) minIOBPredBG = round(IOBpredBG, 0)
             if (IOBpredBG > maxIOBPredBG) maxIOBPredBG = IOBpredBG
-            if (enableUAM && UAMpredBGs.size > 6 && (UAMpredBG!! < minUAMPredBG)) minUAMPredBG = round(UAMpredBG!!, 0)
+            if (enableUAM && UAMpredBGs.size > 6 && (UAMpredBG < minUAMPredBG)) minUAMPredBG = round(UAMpredBG, 0)
         }
 
         rT.predBGs = Predictions()
@@ -2737,7 +2907,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         //fin predictions
         ////////////////////////////////////////////
         //estimation des glucides nécessaires si risque hypo
-        val thresholdBG: Double = 70.0
+        val thresholdBG = 70.0
         val carbsRequired = estimateRequiredCarbs(bg, targetBg.toDouble(), slopeFromDeviations, iob.toDouble(), csf,sens, cob.toDouble())
         val minutesAboveThreshold = calculateMinutesAboveThreshold(bg, slopeFromDeviations, thresholdBG)
         if (carbsRequired >= profile.carbsReqThreshold && minutesAboveThreshold <= 45 && !lunchTime && !dinnerTime && !bfastTime && !highCarbTime && !mealTime) {
@@ -2781,7 +2951,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         )
 
          val (conditionResult, conditionsTrue) = isCriticalSafetyCondition(mealData)
-
+        this.zeroBasalAccumulatedMinutes = getZeroBasalDuration(persistenceLayer,2)
         val screenWidth = preferences.get(IntKey.OApsAIMIlogsize)// Largeur d'écran par défaut en caractères si non spécifié
         val columnWidth = (screenWidth / 2) - 2 // Calcul de la largeur des colonnes en fonction de la largeur de l'écran
 
@@ -2789,7 +2959,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             appendLine("╔${"═".repeat(screenWidth)}╗")
             appendLine(String.format("║ %-${screenWidth}s ║", "AAPS-MASTER-AIMI"))
             appendLine(String.format("║ %-${screenWidth}s ║", "OpenApsAIMI Settings"))
-            appendLine(String.format("║ %-${screenWidth}s ║", "12 Mars 2025"))
+            appendLine(String.format("║ %-${screenWidth}s ║", "28 Mars 2025"))
             appendLine("╚${"═".repeat(screenWidth)}╝")
             appendLine()
 
@@ -2829,6 +2999,9 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             appendLine(String.format("║ %-${columnWidth}s │ %s", "After IOB Adjustment", String.format("%.1f", peakintermediaire)))
             appendLine(String.format("║ %-${columnWidth}s │ %s", "Activity Ratio", String.format("%.1f", profile.futureActivity / (profile.currentActivity + 0.0001))))
             appendLine(String.format("║ %-${columnWidth}s │ %s", "Final Peak Time after coerceIn", String.format("%.1f", tp)))
+            appendLine(String.format("║ %-${columnWidth}s │ %s", "Adjusted Dia H", String.format("%.1f", adjustedDIAInMinutes/60)))
+            appendLine(String.format("║ %-${columnWidth}s │ %s", "pumpAgeDays", String.format("%.1f", pumpAgeDays)))
+            appendLine(String.format("║ %-${columnWidth}s │ %s", "zeroBasalAccumulatedMinutes", String.format("%.1f", zeroBasalAccumulatedMinutes.toDouble())))
             appendLine("╚${"═".repeat(screenWidth)}╝")
             appendLine()
 
@@ -2937,6 +3110,8 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         } else {
             var insulinReq = smbToGive.toDouble()
             val recentBGValues: List<Float> = getRecentBGs()
+            //updateZeroBasalDuration(profile_current_basal)
+
             val safetyDecision = safetyAdjustment(
                 currentBG = bg.toFloat(),
                 predictedBG = predictedBg,
@@ -2947,7 +3122,8 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 tdd24Hrs = tdd24Hrs,
                 tddPerHour = tddPerHour,
                 tirInhypo = currentTIRLow.toFloat(),
-                targetBG = targetBg
+                targetBG = targetBg,
+                zeroBasalDurationMinutes = zeroBasalAccumulatedMinutes
             )
             rT.reason.append(safetyDecision.reason)
 
@@ -2972,10 +3148,10 @@ class DetermineBasalaimiSMB2 @Inject constructor(
 
                 // allow SMBIntervals between 1 and 10 minutes
                 //val SMBInterval = min(10, max(1, profile.SMBInterval))
-                val SMBInterval = min(20, max(1, calculateSMBInterval()))
-                val nextBolusMins = round(SMBInterval - lastBolusAge, 0)
-                val nextBolusSeconds = round((SMBInterval - lastBolusAge) * 60, 0) % 60
-                if (lastBolusAge > SMBInterval) {
+                val smbInterval = min(20, max(1, calculateSMBInterval()))
+                val nextBolusMins = round(smbInterval - lastBolusAge, 0)
+                val nextBolusSeconds = round((smbInterval - lastBolusAge) * 60, 0) % 60
+                if (lastBolusAge > smbInterval) {
                     if (microBolus > 0) {
                         rT.units = microBolus
                         rT.reason.append("Microbolusing ${microBolus}U. ")
@@ -2998,13 +3174,16 @@ class DetermineBasalaimiSMB2 @Inject constructor(
             if (safetyDecision.stopBasal) {
                 return setTempBasal(0.0, 30, profile, rT, currenttemp)
             }
+            if (safetyDecision.basalLS && combinedDelta in -1.0..3.0 && predictedBg > 100 && iob > 0.1){
+                return setTempBasal(profile_current_basal, 30, profile, rT, currenttemp)
+            }
             if (detectMealOnset(delta, predicted.toFloat(), bgAcceleration.toFloat()) && !mealTime && !lunchTime && !bfastTime && !dinnerTime && !sportTime && !snackTime && !highCarbTime && !sleepTime && !lowCarbTime) {
                 rT.reason.append("Détection précoce de repas: activation d'une basale maximale pendant 30 minutes. ")
                 val forcedBasal = profile_current_basal * 10  // Exemple, ajuster le facteur selon le profil
                 return setTempBasal(forcedBasal, 30, profile, rT, currenttemp)
             }
             // 🔴 Sécurité : Arrêt de la basale en cas de tendance baissière ou IOB trop élevé
-            if (bg < 110 && mealData.slopeFromMaxDeviation <= 0 || iob > maxIob) {
+            if (predictedBg < 100 && mealData.slopeFromMaxDeviation <= 0 || iob > maxIob) {
                 return setTempBasal(0.0, 30, profile, rT, currenttemp)
             }
 

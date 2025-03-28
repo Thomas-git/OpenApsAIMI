@@ -294,36 +294,22 @@ class AimiNeuralNetwork(
         }
     }
 
-    //----------------------------------------------------------------------------------------------
-    // 8) Normalisation z-score (optionnelle)
-    //----------------------------------------------------------------------------------------------
-    fun zScoreNormalization(data: List<FloatArray>): List<FloatArray> {
-        if (data.isEmpty()) return emptyList()
-        val dim = data.first().size
-
-        val means = DoubleArray(dim) { 0.0 }
-        val stdDevs = DoubleArray(dim) { 0.0 }
-
-        data.forEach { row ->
-            for (i in row.indices) {
-                means[i] += row[i]
-                stdDevs[i] += (row[i] * row[i])
+    fun copyWeightsFrom(other: AimiNeuralNetwork) {
+        for (i in weightsInputHidden.indices) {
+            for (j in weightsInputHidden[i].indices) {
+                weightsInputHidden[i][j] = other.weightsInputHidden[i][j]
             }
         }
-
-        for (i in means.indices) {
-            means[i] /= data.size
-            stdDevs[i] = kotlin.math.sqrt(stdDevs[i] / data.size - means[i].pow(2.0))
+        for (i in biasHidden.indices) {
+            biasHidden[i] = other.biasHidden[i]
         }
-
-        return data.map { row ->
-            FloatArray(dim) { i ->
-                if (stdDevs[i] != 0.0) {
-                    ((row[i] - means[i]) / stdDevs[i]).toFloat()
-                } else {
-                    (row[i] - means[i]).toFloat()
-                }
+        for (i in weightsHiddenOutput.indices) {
+            for (j in weightsHiddenOutput[i].indices) {
+                weightsHiddenOutput[i][j] = other.weightsHiddenOutput[i][j]
             }
+        }
+        for (i in biasOutput.indices) {
+            biasOutput[i] = other.biasOutput[i]
         }
     }
 }
